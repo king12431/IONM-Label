@@ -24,7 +24,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller numpy matplotlib tkinter
+        pip install pyinstaller numpy matplotlib
     
     - name: Build with PyInstaller
       run: |
