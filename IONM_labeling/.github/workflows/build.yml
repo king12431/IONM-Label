@@ -24,14 +24,15 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller numpy matplotlib
+        pip install pyinstaller numpy matplotlib tkinter
     
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name=MEP_Annotator mep_annotator.py
+        cd IONM_labeling
+        pyinstaller --onefile --windowed --name=MEP_Annotator labeler.py
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v3
       with:
         name: MEP_Annotator-${{ matrix.os }}
-        path: dist/*
+        path: IONM_labeling/dist/*
