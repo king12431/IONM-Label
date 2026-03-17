@@ -2,11 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Interactive MEP / D-wave Waveform Annotator
-- Correct x/y units from metadata (analysis_time, display_len, sensitivity)
-- D-wave: stacked electrode pairs; per-channel Exclude button; per-channel drag
-- Zoom (right=in) + clamped pan sliders
-- Deferred async file writes
-- Single clean class, no duplication
 """
 
 import copy
@@ -41,9 +36,11 @@ def _parse_display_len(metadata: dict) -> float:
         return 10.0
 
 def ms_per_unit(metadata: dict) -> float:
+    """True ms per timepoint index."""
     return (_parse_analysis_time(metadata) * _parse_display_len(metadata)) / 1000.0
 
 def sens_factor(metadata: dict) -> float:
+    """µV per raw amplitude unit."""
     s = str(metadata.get('Sens', '')).strip()
     m = re.match(r'([\d.]+)\s*(uV|µV|mV)', s, re.IGNORECASE)
     if not m:
@@ -52,6 +49,44 @@ def sens_factor(metadata: dict) -> float:
     if m.group(2).lower() == 'mv':
         v *= 1000.0
     return v * 1.5e-4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Annotation unit conversion
+#
+# The original annotator used hardcoded 0.1 ms/unit for ALL signals.
+# Stored value = event.xdata on that axis = true_ms / 0.1
+#
+# So:  stored = true_ms / 0.1
+#      true_ms = stored * 0.1
+#
+# For MEP (true mpu=0.1):   stored = true_ms / 0.1 = true_ms * 10
+#   BUT old MEP files stored event.xdata directly which WAS true_ms
+#   because the old axis used indices * 0.1 = true_ms for MEP.
+#   So old MEP stored value ≈ true_ms (not true_ms*10).
+#
+# After careful analysis of actual files:
+#   MEP  annotation_start_ms="20.79"  → true_ms = 20.79  (identity)
+#   Dwave annotation_start_ms="18.06" → true_ms = 18.06 * true_mpu / 0.1
+#                                      = 18.06 * 0.02 / 0.1 = 3.612ms
+#
+# So the conversion is:  true_ms = stored * true_mpu / 0.1
+#                        stored  = true_ms * 0.1 / true_mpu
+#
+# For MEP true_mpu=0.1:  true_ms = stored * 0.1/0.1 = stored  ✓
+# For Dwave true_mpu=0.02: true_ms = stored * 0.02/0.1 = stored * 0.2 ✓
+# ─────────────────────────────────────────────────────────────────────────────
+
+LEGACY_MPU = 0.1  # original hardcoded ms/unit
+
+def stored_to_true_ms(stored: float, metadata: dict) -> float:
+    """Convert stored annotation value to true ms for plotting."""
+    mpu = ms_per_unit(metadata)
+    return stored * mpu / LEGACY_MPU
+
+def true_ms_to_stored(true_ms: float, metadata: dict) -> float:
+    """Convert true ms (plot coordinate) to stored annotation value."""
+    mpu = ms_per_unit(metadata)
+    return true_ms * LEGACY_MPU / mpu if mpu else true_ms
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,22 +156,16 @@ class MEPAnnotator:
 
         self.history: list = []
         self.history_pos   = -1
-        # marking_mode: None | ('start', None) | ('end', None)
-        # None sub_i always means "all active channels"
-        self.marking_mode  = None
+        self.marking_mode  = None   # None | ('start', None) | ('end', None)
 
         self.fig            = None
         self.axes           = []
-        self.start_lines    = []   # one line handle per subplot
+        self.start_lines    = []
         self.end_lines      = []
         self.preview_lines  = []
-        self.excl_btns      = []   # Exclude button per subplot (D-wave only)
-
-        # dragging: None | ('start'|'end', sub_i)
-        # sub_i is the specific subplot being dragged — individual per channel
-        self.dragging = None
-
-        self.channel_active: list = []   # True = included in global actions
+        self.excl_btns      = []
+        self.dragging       = None  # None | ('start'|'end', sub_i)
+        self.channel_active = []
 
         self._x_full = (0.0, 1.0)
         self._y_full = (-1.0, 1.0)
@@ -145,6 +174,7 @@ class MEPAnnotator:
         self._save_thread = None
 
         self._build_menu()
+        self.master.protocol('WM_DELETE_WINDOW', self._on_exit)
 
     # ── menu ──────────────────────────────────────────────────────────────────
 
@@ -153,18 +183,22 @@ class MEPAnnotator:
         self.master.config(menu=mb)
         fm = Menu(mb, tearoff=0)
         mb.add_cascade(label='File', menu=fm)
-        fm.add_command(label='Open File…', command=self.open_file)
+        fm.add_command(label='Open File…',    command=self.open_file)
         fm.add_command(label='Save (Ctrl+S)', command=self._flush_save)
         fm.add_command(label='Close File',    command=self.close_file)
         fm.add_separator()
-        fm.add_command(label='Exit', command=self._on_exit)
+        fm.add_command(label='Exit',          command=self._on_exit)
         hm = Menu(mb, tearoff=0)
         mb.add_cascade(label='Help', menu=hm)
         hm.add_command(label='Keyboard Shortcuts', command=self._show_help)
 
     def _on_exit(self):
         self._flush_save()
-        self.master.quit()
+        if self._save_thread and self._save_thread.is_alive():
+            self._save_thread.join(timeout=5)
+        if self.fig:
+            plt.close(self.fig)
+        self.master.destroy()
 
     def _show_help(self):
         messagebox.showinfo('Keyboard Shortcuts', """
@@ -172,24 +206,19 @@ Navigation:
   A / ←   Previous group       D / →   Next group
   J        Jump to group        U        Next unannotated
 
-Annotation (applies to all included channels):
-  Y  — Has waveform (auto-starts start→end workflow)
+Annotation (all included channels):
+  Y  — Has waveform (auto starts→end workflow)
   N  — No waveform
-  S/M — Enter start-mark mode, click to place
-  E   — Enter end-mark mode, click to place
+  S/M — Start-mark mode then click
+  E   — End-mark mode then click
   C   — Clear markers
 
 D-wave per-channel:
-  [Excl] button — marks that channel as NO waveform
+  [Excl] — marks that channel NO waveform
   Drag start/end line — moves marker for THAT channel only
 
-Zoom/Pan:
-  X/Y zoom sliders — right = zoom in
-  X/Y pan  sliders — move window within data
-
-Edit:
-  Ctrl+Z  Undo     Ctrl+Y  Redo
-  Ctrl+S  Save     ESC     Cancel marking
+Zoom/Pan sliders — right = zoom in, pan slides window within data
+Ctrl+Z  Undo   Ctrl+Y  Redo   Ctrl+S  Save   ESC  Cancel marking
 """)
 
     # ── file I/O ──────────────────────────────────────────────────────────────
@@ -218,7 +247,6 @@ Edit:
         self.preview_lines = self.excl_btns = []
         self.channel_active = []
         self._dirty = False
-        print('File closed.')
 
     def load_file(self, filepath: str):
         try:
@@ -301,56 +329,42 @@ Edit:
     # ── annotation ────────────────────────────────────────────────────────────
 
     def _get_ann(self, idx: int) -> dict:
+        """Return annotation with start_ms/end_ms in TRUE ms (plot coordinates)."""
         m = self.recordings[idx]['metadata']
+        def to_true(key):
+            if key not in m:
+                return None
+            return stored_to_true_ms(float(m[key]), m)
         return {
             'has_waveform': m.get('annotation_has_waveform'),
-            'start_ms':     float(m['annotation_start_ms']) if 'annotation_start_ms' in m else None,
-            'end_ms':       float(m['annotation_end_ms'])   if 'annotation_end_ms'   in m else None,
+            'start_ms':     to_true('annotation_start_ms'),
+            'end_ms':       to_true('annotation_end_ms'),
         }
 
-    def _set_ann_raw(self, idx: int, *, has_waveform=None, start_ms_raw=None, end_ms_raw=None):
-        """Write annotation in raw axis units (pipeline convention). No file I/O."""
+    def _write_ann(self, idx: int, *, has_waveform=None, start_true_ms=None, end_true_ms=None):
+        """Write annotation. Converts true ms → stored format before saving."""
         m = self.recordings[idx]['metadata']
         if has_waveform is not None:
             m['annotation_has_waveform'] = str(has_waveform)
-        if start_ms_raw is not None:
-            m['annotation_start_ms'] = str(start_ms_raw)
-        if end_ms_raw is not None:
-            m['annotation_end_ms'] = str(end_ms_raw)
+        if start_true_ms is not None:
+            m['annotation_start_ms'] = str(true_ms_to_stored(start_true_ms, m))
+        if end_true_ms is not None:
+            m['annotation_end_ms'] = str(true_ms_to_stored(end_true_ms, m))
         m['annotation_last_modified'] = datetime.now().isoformat()
 
-    def _true_ms_to_raw(self, true_ms: float, idx: int) -> float:
-        """Convert true ms (plot x-coord) → raw axis units for storage."""
-        mpu = ms_per_unit(self.recordings[idx]['metadata'])
-        return true_ms / mpu if mpu else true_ms
-
-    def _raw_to_true_ms(self, raw: float, idx: int) -> float:
-        """Convert stored raw axis units → true ms for plotting."""
-        mpu = ms_per_unit(self.recordings[idx]['metadata'])
-        return raw * mpu
-
-    def _group_ann(self) -> dict:
-        """Annotation of the first (reference) recording in current group."""
-        return self._get_ann(self.groups[self.group_idx][0])
-
-    def _set_group_ann(self, *, has_waveform=None, start_true_ms=None, end_true_ms=None):
-        """Apply annotation to all active channels in current group."""
+    def _write_group(self, *, has_waveform=None, start_true_ms=None, end_true_ms=None):
+        """Write annotation to all active channels in current group."""
         self._save_history()
         for sub_i, idx in enumerate(self.groups[self.group_idx]):
             if not self.channel_active[sub_i]:
                 continue
-            kw = {}
-            if has_waveform is not None:
-                kw['has_waveform'] = has_waveform
-            if start_true_ms is not None:
-                kw['start_ms_raw'] = self._true_ms_to_raw(start_true_ms, idx)
-            if end_true_ms is not None:
-                kw['end_ms_raw'] = self._true_ms_to_raw(end_true_ms, idx)
-            self._set_ann_raw(idx, **kw)
+            self._write_ann(idx,
+                has_waveform=has_waveform,
+                start_true_ms=start_true_ms,
+                end_true_ms=end_true_ms)
         self._mark_dirty()
 
     def _exclude_channel(self, sub_i: int):
-        """Mark one channel as NO waveform and clear its markers."""
         self._save_history()
         idx = self.groups[self.group_idx][sub_i]
         m   = self.recordings[idx]['metadata']
@@ -402,11 +416,11 @@ Edit:
         self.fig.canvas.mpl_disconnect(
             self.fig.canvas.manager.key_press_handler_id)
 
-        self.axes          = []
-        self.start_lines   = []
-        self.end_lines     = []
-        self.preview_lines = []
-        self.excl_btns     = []
+        self.axes           = []
+        self.start_lines    = []
+        self.end_lines      = []
+        self.preview_lines  = []
+        self.excl_btns      = []
         self.channel_active = [True] * n
 
         BOTTOM = 0.28
@@ -414,16 +428,11 @@ Edit:
         GAP    = 0.012
         avail  = 1.0 - BOTTOM - TOP_M
         sh     = (avail - GAP * (n - 1)) / n
-
-        # Waveform plots leave a small right margin for the Exclude button
-        PLOT_L = 0.08
-        PLOT_W = 0.82
-        BTN_L  = 0.915
-        BTN_W  = 0.07
+        PLOT_L, PLOT_W = 0.08, 0.82
+        BTN_L,  BTN_W  = 0.915, 0.07
 
         for i in range(n):
             bottom = BOTTOM + (n - 1 - i) * (sh + GAP)
-
             ax = self.fig.add_axes([PLOT_L, bottom, PLOT_W, sh])
             self.axes.append(ax)
             self.start_lines.append(None)
@@ -431,7 +440,6 @@ Edit:
             self.preview_lines.append(None)
 
             if self.is_dwave:
-                # Exclude button centred vertically in the subplot row
                 btn_h  = min(0.04, sh * 0.4)
                 btn_b  = bottom + (sh - btn_h) / 2
                 btn_ax = self.fig.add_axes([BTN_L, btn_b, BTN_W, btn_h])
@@ -456,7 +464,7 @@ Edit:
         for sl in (self.sl_xzoom, self.sl_yzoom, self.sl_xpan, self.sl_ypan):
             sl.on_changed(self._apply_zoom_pan)
 
-        # Global buttons
+        # Buttons
         BY, BH = 0.07, 0.045
         def _btn(x, w, label, **kw):
             return Button(self.fig.add_axes([x, BY, w, BH]), label, **kw)
@@ -515,12 +523,6 @@ Edit:
         if self.fig:
             self.fig.canvas.draw_idle()
 
-    def _reset_sliders(self):
-        for sl in (self.sl_xzoom, self.sl_yzoom, self.sl_xpan, self.sl_ypan):
-            sl.eventson = False
-            sl.set_val(1.0 if sl in (self.sl_xzoom, self.sl_yzoom) else 0.5)
-            sl.eventson = True
-
     # ── plot update ───────────────────────────────────────────────────────────
 
     def update_plot(self):
@@ -552,7 +554,8 @@ Edit:
             all_x.extend([float(t_ms.min()), float(t_ms.max())])
             all_y.extend([float(y_uv.min()), float(y_uv.max())])
 
-            ann = self._get_ann(rec_idx)   # per-channel annotation
+            # Per-channel annotation (already in true ms)
+            ann = self._get_ann(rec_idx)
 
             if ann['has_waveform'] == 'False':
                 bg = '#FFE5E5'
@@ -575,43 +578,47 @@ Edit:
                 ax.set_title(f'Electrodes {pair}{suffix}', fontsize=9, loc='left', pad=2)
             else:
                 ax.set_title(
-                    f'{rec["metadata"].get("Wave comment","")}  —  '
-                    f'{rec["metadata"].get("Date & time 0","")}',
+                    f'{rec["metadata"].get("Wave comment", "")}  —  '
+                    f'{rec["metadata"].get("Date & time 0", "")}',
                     fontsize=10, fontweight='bold')
 
-            # Markers — each channel uses its OWN annotation
+            # Draw markers — ann values are already in true ms
             if ann['start_ms'] is not None:
-                true_start = self._raw_to_true_ms(ann['start_ms'], rec_idx)
                 self.start_lines[sub_i] = ax.axvline(
-                    true_start, color='green', ls='--', lw=2.5, label='Start',
-                    picker=True, pickradius=5)
+                    ann['start_ms'], color='green', ls='--', lw=2.5,
+                    label='Start', picker=True, pickradius=5)
             else:
                 self.start_lines[sub_i] = None
 
             if ann['end_ms'] is not None:
-                true_end = self._raw_to_true_ms(ann['end_ms'], rec_idx)
                 self.end_lines[sub_i] = ax.axvline(
-                    true_end, color='red', ls='--', lw=2.5, label='End',
-                    picker=True, pickradius=5)
+                    ann['end_ms'], color='red', ls='--', lw=2.5,
+                    label='End', picker=True, pickradius=5)
             else:
                 self.end_lines[sub_i] = None
 
             if sub_i == n - 1:
                 ax.set_xlabel('Time (ms)', fontsize=10)
-
             if ann['start_ms'] is not None or ann['end_ms'] is not None:
                 ax.legend(fontsize=8, loc='upper right')
 
+        # Update full data extents; re-centre pan if range changed
         if all_x:
             pad_x = (max(all_x) - min(all_x)) * 0.02 or 1.0
             pad_y = (max(all_y) - min(all_y)) * 0.10 or 1.0
-            self._x_full = (min(all_x) - pad_x, max(all_x) + pad_x)
-            self._y_full = (min(all_y) - pad_y, max(all_y) + pad_y)
+            new_x = (min(all_x) - pad_x, max(all_x) + pad_x)
+            new_y = (min(all_y) - pad_y, max(all_y) + pad_y)
+            if new_x != self._x_full or new_y != self._y_full:
+                self._x_full = new_x
+                self._y_full = new_y
+                for sl in (self.sl_xpan, self.sl_ypan):
+                    sl.eventson = False
+                    sl.set_val(0.5)
+                    sl.eventson = True
 
-        self._reset_sliders()
         self._apply_zoom_pan()
 
-        # Info bar — summarise per-channel status
+        # Info bar
         total_ann = sum(
             1 for r in self.recordings
             if r['metadata'].get('annotation_has_waveform') is not None)
@@ -643,10 +650,9 @@ Edit:
 
     def _nav_to(self, gi: int):
         self._flush_save()
-        self.group_idx    = gi
-        self.marking_mode = None
-        n = len(self.groups[gi])
-        self.channel_active = [True] * n
+        self.group_idx      = gi
+        self.marking_mode   = None
+        self.channel_active = [True] * len(self.groups[gi])
         self.update_plot()
 
     def prev_group(self):
@@ -677,7 +683,7 @@ Edit:
     # ── annotation actions ────────────────────────────────────────────────────
 
     def mark_has_waveform(self, yes: bool):
-        self._set_group_ann(has_waveform=yes)
+        self._write_group(has_waveform=yes)
         self.marking_mode = ('start', None) if yes else None
         self.update_plot()
 
@@ -688,10 +694,11 @@ Edit:
     def clear_marks(self):
         self._save_history()
         for sub_i, idx in enumerate(self.groups[self.group_idx]):
-            if self.channel_active[sub_i]:
-                m = self.recordings[idx]['metadata']
-                m.pop('annotation_start_ms', None)
-                m.pop('annotation_end_ms',   None)
+            if not self.channel_active[sub_i]:
+                continue
+            m = self.recordings[idx]['metadata']
+            m.pop('annotation_start_ms', None)
+            m.pop('annotation_end_ms',   None)
         self._mark_dirty()
         self.update_plot()
 
@@ -705,8 +712,6 @@ Edit:
 
     def _on_move(self, event):
         ax_i = self._ax_at(event)
-
-        # clear previews on axes we've left
         for i in range(len(self.axes)):
             if i != ax_i and self.preview_lines[i] is not None:
                 try:
@@ -714,22 +719,17 @@ Edit:
                 except Exception:
                     pass
                 self.preview_lines[i] = None
-
         if ax_i < 0 or event.xdata is None:
             self.fig.canvas.draw_idle()
             return
-
         t = event.xdata
-
         if self.dragging:
             which, drag_sub = self.dragging
-            # Only update the line in the subplot being dragged
             line = self.start_lines[drag_sub] if which == 'start' else self.end_lines[drag_sub]
             if line is not None:
                 line.set_xdata([t, t])
             self.fig.canvas.draw_idle()
             return
-
         if self.marking_mode:
             if self.preview_lines[ax_i] is not None:
                 try:
@@ -745,27 +745,24 @@ Edit:
         ax_i = self._ax_at(event)
         if ax_i < 0 or event.xdata is None:
             return
-        t = event.xdata
+        t = event.xdata   # true ms (plot coordinate)
 
-        # Drag initiation: check if near a marker line IN THIS SPECIFIC subplot
+        # Drag initiation
         if not self.marking_mode:
             rec_idx = self.groups[self.group_idx][ax_i]
-            ann     = self._get_ann(rec_idx)
-            if ann['start_ms'] is not None:
-                true_start = self._raw_to_true_ms(ann['start_ms'], rec_idx)
-                if abs(t - true_start) < 2:
-                    self.dragging = ('start', ax_i)
-                    return
-            if ann['end_ms'] is not None:
-                true_end = self._raw_to_true_ms(ann['end_ms'], rec_idx)
-                if abs(t - true_end) < 2:
-                    self.dragging = ('end', ax_i)
-                    return
+            ann     = self._get_ann(rec_idx)   # true ms
+            xlim    = self.axes[ax_i].get_xlim()
+            thresh  = (xlim[1] - xlim[0]) * 0.02
+            if ann['end_ms'] is not None and abs(t - ann['end_ms']) < thresh:
+                self.dragging = ('end', ax_i)
+                return
+            if ann['start_ms'] is not None and abs(t - ann['start_ms']) < thresh:
+                self.dragging = ('start', ax_i)
+                return
 
         # Marking click
         if self.marking_mode:
             mode, _ = self.marking_mode
-
             if self.preview_lines[ax_i] is not None:
                 try:
                     self.preview_lines[ax_i].remove()
@@ -773,18 +770,14 @@ Edit:
                     pass
                 self.preview_lines[ax_i] = None
 
-            # Write to all active channels
             self._save_history()
             for sub_i, idx in enumerate(self.groups[self.group_idx]):
                 if not self.channel_active[sub_i]:
                     continue
-                raw = self._true_ms_to_raw(t, idx)
-                m   = self.recordings[idx]['metadata']
                 if mode == 'start':
-                    m['annotation_start_ms'] = str(raw)
+                    self._write_ann(idx, start_true_ms=t)
                 else:
-                    m['annotation_end_ms'] = str(raw)
-                m['annotation_last_modified'] = datetime.now().isoformat()
+                    self._write_ann(idx, end_true_ms=t)
             self._mark_dirty()
 
             self.marking_mode = ('end', None) if mode == 'start' else None
@@ -794,16 +787,12 @@ Edit:
         if self.dragging:
             which, drag_sub = self.dragging
             if event.xdata is not None:
-                # Write the drag result ONLY to the dragged subplot's recording
                 idx = self.groups[self.group_idx][drag_sub]
-                raw = self._true_ms_to_raw(event.xdata, idx)
                 self._save_history()
-                m = self.recordings[idx]['metadata']
                 if which == 'start':
-                    m['annotation_start_ms'] = str(raw)
+                    self._write_ann(idx, start_true_ms=event.xdata)
                 else:
-                    m['annotation_end_ms'] = str(raw)
-                m['annotation_last_modified'] = datetime.now().isoformat()
+                    self._write_ann(idx, end_true_ms=event.xdata)
                 self._mark_dirty()
                 self.update_plot()
         self.dragging = None
@@ -838,7 +827,9 @@ def main():
     root.title('MEP / D-wave Annotator')
     root.geometry('280x80')
     annotator = MEPAnnotator(master=root)
-    tk.Label(root, text='MEP / D-wave Annotator\n\nFile → Open File to begin', pady=10).pack()
+    tk.Label(root,
+             text='MEP / D-wave Annotator\n\nFile → Open File to begin',
+             pady=10).pack()
 
     import sys
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
